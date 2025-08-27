@@ -1,6 +1,7 @@
-discord.py
-python-dotenv
-yt-dlp
-spotipy
-aiohttp
-requests
+discord.py==2.6.2
+PyNaCl==1.5.0
+yt-dlp==2025.8.22
+spotipy==2.25.1
+aiohttp==3.12.15
+requests==2.32.5
+python-dotenv==1.1.1
