@@ -262,8 +262,10 @@ async def play(interaction: discord.Interaction, song_query: str):
 
     ydl_options = {
         "format": "bestaudio[abr<=96]/bestaudio",
-        "noplaylist": True
+        "noplaylist": True,
+        "cookiefile": "cookies.txt"  # archivo que subiste a la raíz de tu proyecto
     }
+
 
     guild_id = str(interaction.guild_id)
     SONG_QUEUES.setdefault(guild_id, deque())
