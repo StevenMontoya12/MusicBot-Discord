@@ -264,7 +264,6 @@ async def play(interaction: discord.Interaction, song_query: str):
         "format": "bestaudio[abr<=96]/bestaudio",
         "noplaylist": True,
         "cookiefile": "cookies.txt",
-        "proxy": "socks5://127.0.0.1:9050"  # ejemplo usando Tor
     }
 
 
