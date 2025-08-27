@@ -37,11 +37,14 @@ if not os.path.isfile(FFMPEG_PATH):
 # =========================
 # CLIENTES EXTERNOS
 # =========================
-spotify = Spotify(auth_manager=SpotifyClientCredentials(
-    client_id=SPOTIFY_CLIENT_ID,
-    client_secret=SPOTIFY_CLIENT_SECRET
-))
+from spotipy import Spotify
+from spotipy.oauth2 import SpotifyClientCredentials
 
+# Inicialización de Spotify con credenciales desde variables de entorno
+spotify = Spotify(auth_manager=SpotifyClientCredentials(
+    client_id=os.getenv("SPOTIPY_CLIENT_ID"),
+    client_secret=os.getenv("SPOTIPY_CLIENT_SECRET")
+))
 # =========================
 # ESTRUCTURAS DE ESTADO
 # =========================
