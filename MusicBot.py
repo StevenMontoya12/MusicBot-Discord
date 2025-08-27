@@ -26,7 +26,7 @@ LASTFM_API_KEY = os.getenv("LASTFM_API_KEY")   # Recomendado
 LASTFM_USER = os.getenv("LASTFM_USER")         # Recomendado
 
 # Ruta estática a FFmpeg (ajústala a tu sistema)
-FFMPEG_PATH = "D:/LaLic/bin/ffmpeg/ffmpeg.exe"
+FFMPEG_PATH = "ffmpeg"
 
 # Aviso si la ruta no existe (no bloquea la ejecución)
 if not os.path.isfile(FFMPEG_PATH):
@@ -612,7 +612,26 @@ async def help_cmd(interaction: discord.Interaction):
 
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
-# =========================
-# INICIO DEL BOT
-# =========================
+
+
+from threading import Thread
+from http.server import HTTPServer, BaseHTTPRequestHandler
+
+PORT = int(os.environ.get("PORT", 10000))
+
+class DummyHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Bot corriendo")
+
+def start_dummy_server():
+    server = HTTPServer(("0.0.0.0", PORT), DummyHandler)
+    server.serve_forever()
+
+Thread(target=start_dummy_server, daemon=True).start()
+print(f"Bot corriendo en Render (dummy port {PORT})")
+
+# Luego tu bot
 bot.run(TOKEN)
+
