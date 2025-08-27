@@ -11,9 +11,9 @@ from spotipy import Spotify
 from spotipy.oauth2 import SpotifyClientCredentials
 import aiohttp
 import requests
+import imageio_ffmpeg as ffmpeg
+
 from datetime import timedelta
-from threading import Thread
-from http.server import HTTPServer, BaseHTTPRequestHandler
 
 # =========================
 # CARGA DE CONFIGURACIÓN
@@ -22,12 +22,17 @@ load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 SPOTIFY_CLIENT_ID = os.getenv("SPOTIFY_CLIENT_ID")
 SPOTIFY_CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET")
-LASTFM_API_KEY = os.getenv("LASTFM_API_KEY")
-LASTFM_USER = os.getenv("LASTFM_USER")
-FFMPEG_PATH = "ffmpeg"
 
+# Opcional para Last.fm (para /lastfm)
+LASTFM_API_KEY = os.getenv("LASTFM_API_KEY")   # Recomendado
+LASTFM_USER = os.getenv("LASTFM_USER")         # Recomendado
+
+# Ruta estática a FFmpeg (ajústala a tu sistema)
+FFMPEG_PATH = ffmpeg.get_ffmpeg_exe()
+
+# Aviso si la ruta no existe (no bloquea la ejecución)
 if not os.path.isfile(FFMPEG_PATH):
-    print(f"[DEBUG][AVISO] No se encontró FFmpeg en: {FFMPEG_PATH}")
+    print(f"[AVISO] No se encontró FFmpeg en: {FFMPEG_PATH}. Verifica la ruta o ponlo en el PATH.")
 
 # =========================
 # CLIENTES EXTERNOS
@@ -40,15 +45,24 @@ spotify = Spotify(auth_manager=SpotifyClientCredentials(
 # =========================
 # ESTRUCTURAS DE ESTADO
 # =========================
+# Cola por servidor: deque de dicts con metadata completa de la pista
+# { url, title, webpage_url, duration, thumbnail, artist }
 SONG_QUEUES: dict[str, deque] = {}
+
+# Modo de loop por servidor: "off" | "one" | "all"
 LOOP_MODE: dict[str, str] = {}
+
+# Volumen actual por servidor (0.0 - 1.0)
 VOLUME: dict[str, float] = {}
+
+# Canción actual por servidor (dict con la misma forma que los items de la cola)
 CURRENT_SONG: dict[str, dict] = {}
 
 # =========================
 # BOT
 # =========================
-intents = discord.Intents.all()
+intents = discord.Intents.default()
+intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # =========================
@@ -59,25 +73,20 @@ async def search_ytdlp_async(query, ydl_opts):
     return await loop.run_in_executor(None, lambda: _extract(query, ydl_opts))
 
 def _extract(query, ydl_opts):
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(query, download=False)
-            print(f"[DEBUG] yt_dlp info encontrada para query: {query}")
-            return info
-    except Exception as e:
-        print(f"[ERROR][yt_dlp] {e}")
-        return None
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        return ydl.extract_info(query, download=False)
 
-def format_duration(seconds):
+def format_duration(seconds: int | float | None) -> str:
     if seconds is None:
         return "Desconocido"
     try:
-        return str(timedelta(seconds=int(seconds)))
-    except Exception as e:
-        print(f"[ERROR][format_duration] {e}")
+        seconds = int(seconds)
+        return str(timedelta(seconds=seconds))
+    except Exception:
         return "Desconocido"
 
-def make_queue_item(from_info: dict):
+def make_queue_item(from_info: dict) -> dict:
+    """Convierte la info cruda de yt_dlp en un objeto estándar para la cola."""
     return {
         "url": from_info.get("url"),
         "title": from_info.get("title", "Sin título"),
@@ -88,40 +97,38 @@ def make_queue_item(from_info: dict):
     }
 
 def get_spotify_playlist_tracks(playlist_id: str):
-    try:
-        tracks = []
-        response = spotify.playlist_items(playlist_id, additional_types=['track'], limit=100)
+    tracks = []
+    response = spotify.playlist_items(playlist_id, additional_types=['track'], limit=100)
+    tracks.extend(response['items'])
+    while response['next']:
+        response = spotify.next(response)
         tracks.extend(response['items'])
-        while response['next']:
-            response = spotify.next(response)
-            tracks.extend(response['items'])
-        print(f"[DEBUG] Spotify playlist tracks obtenidas: {len(tracks)}")
-        return tracks
-    except Exception as e:
-        print(f"[ERROR][Spotify playlist] {e}")
-        return []
+    return tracks
 
 # =========================
 # EVENTOS
 # =========================
 @bot.event
 async def on_ready():
-    try:
-        await bot.tree.sync()
-        print(f"[DEBUG] {bot.user} is online! Commands synced")
-    except Exception as e:
-        print(f"[ERROR][on_ready] {e}")
+    await bot.tree.sync()
+    print(f"{bot.user} is online!")
 
 # =========================
 # REPRODUCCIÓN
 # =========================
-async def start_playback(vc, guild_id, channel, start_seconds=0):
+async def start_playback(vc: discord.VoiceClient, guild_id: str, channel: discord.abc.Messageable, start_seconds: int = 0):
+    """
+    Inicia/reinicia la reproducción de la canción actual (CURRENT_SONG[guild_id])
+    con soporte de 'after' para encadenar a la siguiente canción y respetar el loop.
+    """
     current = CURRENT_SONG.get(guild_id)
     if not current:
+        # Si no hay actual, intenta tomar de la cola
         if SONG_QUEUES.get(guild_id):
             CURRENT_SONG[guild_id] = SONG_QUEUES[guild_id][0]
             current = CURRENT_SONG[guild_id]
         else:
+            # Nada que reproducir
             try:
                 if vc:
                     await vc.disconnect()
@@ -131,25 +138,55 @@ async def start_playback(vc, guild_id, channel, start_seconds=0):
             CURRENT_SONG.pop(guild_id, None)
             VOLUME.pop(guild_id, None)
             LOOP_MODE[guild_id] = "off"
-            print(f"[DEBUG][start_playback] Nada que reproducir en guild {guild_id}")
             return
 
     url = current["url"]
     volume = VOLUME.get(guild_id, 0.5)
+
     before = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
-    if start_seconds > 0:
+    if start_seconds and start_seconds > 0:
         before = f"-ss {int(start_seconds)} " + before
 
     def after(error):
         if error:
-            print(f"[ERROR][after playback] {error}")
+            print(f"[after] Error en reproducción: {error}")
+
+        # Al finalizar, mover cola según loop
+        mode = LOOP_MODE.get(guild_id, "off")
+        try:
+            if mode == "off":
+                # Sacar la actual
+                if SONG_QUEUES.get(guild_id):
+                    try:
+                        # Si la actual coincide con el primer elemento, popleft.
+                        if SONG_QUEUES[guild_id] and SONG_QUEUES[guild_id][0] is current:
+                            SONG_QUEUES[guild_id].popleft()
+                        else:
+                            # Si no coincide, aún así intentamos remover por igualdad.
+                            if current in SONG_QUEUES[guild_id]:
+                                SONG_QUEUES[guild_id].remove(current)
+                    except Exception:
+                        pass
+            elif mode == "all":
+                # Rotar (mover la primera al final)
+                if SONG_QUEUES.get(guild_id) and len(SONG_QUEUES[guild_id]) > 0:
+                    SONG_QUEUES[guild_id].rotate(-1)
+            elif mode == "one":
+                # No mover la cola; dejamos la misma canción en cabeza
+                pass
+        except Exception as e:
+            print(f"[after] Error gestionando loop/cola: {e}")
+
+        # Llamar recursivo a play_next
         fut = asyncio.run_coroutine_threadsafe(play_next(vc, guild_id, channel), bot.loop)
         try:
             fut.result()
         except Exception as e:
-            print(f"[ERROR][after playback future] {e}")
+            print(f"[after] Error al continuar reproducción: {e}")
 
+    # Construir la fuente de audio y reproducir
     try:
+        # 🔧 Cambio clave: options="-vn" (sin forzar libopus)
         source = discord.FFmpegPCMAudio(
             url,
             executable=FFMPEG_PATH,
@@ -157,11 +194,17 @@ async def start_playback(vc, guild_id, channel, start_seconds=0):
             options="-vn"
         )
         vc.play(discord.PCMVolumeTransformer(source, volume=volume), after=after)
-        print(f"[DEBUG][start_playback] Reproduciendo: {current['title']} en guild {guild_id}")
     except Exception as e:
-        print(f"[ERROR][start_playback] {e}")
+        print(f"[start_playback] Error al iniciar reproducción: {e}")
+        # Intentar saltar a la siguiente
+        fut = asyncio.run_coroutine_threadsafe(play_next(vc, guild_id, channel), bot.loop)
+        try:
+            fut.result()
+        except Exception as er:
+            print(f"[start_playback] Error al encadenar: {er}")
+        return
 
-    # Embed Now Playing
+    # Enviar Embed "Ahora suena"
     try:
         embed = discord.Embed(
             title="🎵 Ahora suena",
@@ -172,209 +215,412 @@ async def start_playback(vc, guild_id, channel, start_seconds=0):
         embed.add_field(name="Duración", value=format_duration(current["duration"]), inline=True)
         if current.get("thumbnail"):
             embed.set_thumbnail(url=current["thumbnail"])
-        asyncio.create_task(channel.send(embed=embed))
+        await channel.send(embed=embed)
     except Exception as e:
-        print(f"[ERROR][start_playback embed] {e}")
+        print(f"[start_playback] Error al enviar embed: {e}")
 
-async def play_next(vc, guild_id, channel):
-    if not SONG_QUEUES.get(guild_id):
+async def play_next(vc: discord.VoiceClient, guild_id: str, channel: discord.abc.Messageable):
+    """
+    Obtiene el siguiente elemento que debería sonar (según el loop) y llama a start_playback.
+    """
+    # Si la cola está vacía, desconectarse y limpiar
+    if not SONG_QUEUES.get(guild_id) or len(SONG_QUEUES[guild_id]) == 0:
         try:
             if vc:
                 await vc.disconnect()
         except Exception:
             pass
+        SONG_QUEUES[guild_id] = deque()
         CURRENT_SONG.pop(guild_id, None)
         VOLUME.pop(guild_id, None)
         LOOP_MODE[guild_id] = "off"
-        print(f"[DEBUG][play_next] Cola vacía en guild {guild_id}")
         return
 
+    # La canción "actual" debe ser el primer elemento de la cola
     CURRENT_SONG[guild_id] = SONG_QUEUES[guild_id][0]
+    # Iniciar reproducción desde 0s
     await start_playback(vc, guild_id, channel, start_seconds=0)
 
 # =========================
 # COMANDOS
 # =========================
-# ----- PLAY -----
 @bot.tree.command(name="play", description="Play a song, playlist, or add to the queue.")
 @app_commands.describe(song_query="Search term or URL from YouTube, Spotify, or SoundCloud")
-async def play_cmd(interaction: discord.Interaction, song_query: str):
-    print(f"[DEBUG] /play invoked by {interaction.user} with query: {song_query}")
+async def play(interaction: discord.Interaction, song_query: str):
     await interaction.response.defer()
+
+    # Conectar/encaminar al canal de voz
+    if interaction.guild.voice_client is None:
+        if interaction.user.voice is None:
+            await interaction.followup.send("¡Debes estar en un canal de voz para reproducir música!")
+            return
+        vc = await interaction.user.voice.channel.connect()
+    else:
+        vc = interaction.guild.voice_client
+        if interaction.user.voice and vc.channel != interaction.user.voice.channel:
+            await vc.move_to(interaction.user.voice.channel)
+
+    ydl_options = {
+        "format": "bestaudio[abr<=96]/bestaudio",
+        "noplaylist": True
+    }
+
     guild_id = str(interaction.guild_id)
     SONG_QUEUES.setdefault(guild_id, deque())
     LOOP_MODE.setdefault(guild_id, "off")
     VOLUME.setdefault(guild_id, 0.5)
 
-    try:
-        if interaction.guild.voice_client is None:
-            if interaction.user.voice is None:
-                await interaction.followup.send("¡Debes estar en un canal de voz!")
-                return
-            vc = await interaction.user.voice.channel.connect()
-        else:
-            vc = interaction.guild.voice_client
-            if interaction.user.voice and vc.channel != interaction.user.voice.channel:
-                await vc.move_to(interaction.user.voice.channel)
-    except Exception as e:
-        await interaction.followup.send(f"[ERROR][voice connect] {e}")
-        print(f"[ERROR][voice connect] {e}")
-        return
-
-    try:
-        # Soporte Spotify
-        if "open.spotify.com" in song_query:
-            # Track
-            if "/track/" in song_query:
-                track_id = re.search(r"track/([a-zA-Z0-9]+)", song_query)
-                if track_id:
+    # Soporte Spotify (track o playlist)
+    if "open.spotify.com" in song_query:
+        # Track individual
+        if "/track/" in song_query:
+            track_id = re.search(r"track/([a-zA-Z0-9]+)", song_query)
+            if track_id:
+                try:
                     track = spotify.track(track_id.group(1))
                     query = f"{track['name']} {track['artists'][0]['name']}"
-                    print(f"[DEBUG][Spotify Track] query: {query}")
-                    song_query = query
-            # Playlist
-            elif "/playlist/" in song_query:
-                playlist_id = re.search(r"playlist/([a-zA-Z0-9]+)", song_query)
-                tracks = get_spotify_playlist_tracks(playlist_id.group(1))
-                for t in tracks:
-                    q = f"{t['track']['name']} {t['track']['artists'][0]['name']}"
-                    ydl_opts = {"format": "bestaudio[abr<=96]/bestaudio", "noplaylist": True}
-                    info = await search_ytdlp_async(f"ytsearch1:{q}", ydl_opts)
-                    if info and 'entries' in info:
-                        SONG_QUEUES[guild_id].append(make_queue_item(info['entries'][0]))
-                await interaction.followup.send(f"✅ Playlist agregada: {len(tracks)} canciones")
-                if not vc.is_playing():
-                    await play_next(vc, guild_id, interaction.channel)
-                return
+                    # Búsqueda en YouTube con ese query
+                    results = await search_ytdlp_async(f"ytsearch1:{query}", ydl_options)
+                    if not results:
+                        await interaction.followup.send(f"No se encontró resultado para: {query}")
+                        return
+                    first = results['entries'][0] if 'entries' in results else results
+                    item = make_queue_item(first)
+                    SONG_QUEUES[guild_id].append(item)
+                    await interaction.followup.send(f"✅ Añadido a la cola: **{item['title']}**")
+                except Exception as e:
+                    await interaction.followup.send(f"Error con Spotify track: {e}")
+                    return
 
-        ydl_opts = {"format": "bestaudio[abr<=96]/bestaudio", "noplaylist": True}
-        search_q = f"ytsearch1:{song_query}" if not song_query.startswith("http") else song_query
-        results = await search_ytdlp_async(search_q, ydl_opts)
-        if not results:
-            await interaction.followup.send(f"No se encontró: {song_query}")
-            print(f"[DEBUG][play] No results for query: {song_query}")
-            return
-        first = results['entries'][0] if 'entries' in results else results
-        item = make_queue_item(first)
-        SONG_QUEUES[guild_id].append(item)
-        await interaction.followup.send(f"✅ Añadido: {item['title']}")
-        print(f"[DEBUG][play] Añadido a cola: {item['title']}")
-        if not vc.is_playing():
+        # Playlist completa
+        elif "/playlist/" in song_query:
+            playlist_id = re.search(r"playlist/([a-zA-Z0-9]+)", song_query)
+            if playlist_id:
+                try:
+                    items = get_spotify_playlist_tracks(playlist_id.group(1))
+                    added = 0
+                    for entry in items:
+                        track = entry.get('track')
+                        if not track:
+                            continue
+                        query = f"{track['name']} {track['artists'][0]['name']}"
+                        try:
+                            results = await search_ytdlp_async(f"ytsearch1:{query}", ydl_options)
+                            if not results:
+                                continue
+                            first = results['entries'][0] if 'entries' in results else results
+                            SONG_QUEUES[guild_id].append(make_queue_item(first))
+                            added += 1
+                        except Exception:
+                            continue
+                    await interaction.followup.send(f"✅ Añadidas {added} canciones desde la playlist de Spotify.")
+                except Exception as e:
+                    await interaction.followup.send(f"Error al procesar la playlist de Spotify: {e}")
+                    return
+
+        # Si era Spotify, empezamos a reproducir si no hay nada sonando
+        vc = interaction.guild.voice_client
+        if vc and not vc.is_playing():
             await play_next(vc, guild_id, interaction.channel)
-    except Exception as e:
-        await interaction.followup.send(f"[ERROR][play] {e}")
-        print(f"[ERROR][play] {e}")
+        return
 
-# ----- SKIP -----
-@bot.tree.command(name="skip", description="Skip current song")
-async def skip_cmd(interaction: discord.Interaction):
+    # Si no es Spotify: búsqueda o URL directa
+    try:
+        search_q = f"ytsearch1:{song_query}" if not song_query.startswith("http") else song_query
+        results = await search_ytdlp_async(search_q, ydl_options)
+    except Exception as e:
+        await interaction.followup.send(f"Error while searching: {str(e)}")
+        return
+
+    if not results:
+        await interaction.followup.send(f"No results for: {song_query}")
+        return
+
+    first = results['entries'][0] if 'entries' in results else results
+    item = make_queue_item(first)
+    SONG_QUEUES[guild_id].append(item)
+    await interaction.followup.send(f"{'Reproduciendo ahora' if not vc.is_playing() else '✅ Añadido a la cola'}: **{item['title']}**")
+
+    if not vc.is_playing():
+        await play_next(vc, guild_id, interaction.channel)
+
+@bot.tree.command(name="nowplaying", description="Muestra info detallada de la canción actual")
+async def nowplaying_cmd(interaction: discord.Interaction):
     guild_id = str(interaction.guild_id)
+    current = CURRENT_SONG.get(guild_id)
+    if not current:
+        await interaction.response.send_message("No hay canción sonando ahora.")
+        return
+
+    embed = discord.Embed(
+        title="🎶 Ahora sonando",
+        description=f"[{current['title']}]({current['webpage_url']})",
+        color=0x00ccff
+    )
+    embed.add_field(name="Artista", value=current.get("artist", "Desconocido"), inline=True)
+    embed.add_field(name="Duración", value=format_duration(current.get("duration")), inline=True)
+    if current.get("thumbnail"):
+        embed.set_thumbnail(url=current["thumbnail"])
+    await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(name="seek", description="Avanza o retrocede en la canción actual a un tiempo (segundos)")
+@app_commands.describe(seconds="Tiempo en segundos al que deseas ir (ej. 90 para 1:30)")
+async def seek_cmd(interaction: discord.Interaction, seconds: int):
+    vc = interaction.guild.voice_client
+    guild_id = str(interaction.guild_id)
+    current = CURRENT_SONG.get(guild_id)
+
+    if not vc or not current:
+        await interaction.response.send_message("No hay canción en reproducción.")
+        return
+
+    # Reiniciar la reproducción en el offset solicitado
+    try:
+        vc.stop()
+    except Exception:
+        pass
+
+    await start_playback(vc, guild_id, interaction.channel, start_seconds=max(0, int(seconds)))
+    await interaction.response.send_message(f"⏩ Saltado a {format_duration(seconds)}")
+
+@bot.tree.command(name="loop", description="Configura el modo de repetición (off/one/all)")
+@app_commands.describe(mode="off/one/all")
+async def loop_cmd(interaction: discord.Interaction, mode: str):
+    if mode not in ["off", "one", "all"]:
+        await interaction.response.send_message("Opciones válidas: `off`, `one`, `all`")
+        return
+    LOOP_MODE[str(interaction.guild_id)] = mode
+    icon = {"off": "❌", "one": "🔂", "all": "🔁"}[mode]
+    await interaction.response.send_message(f"{icon} Loop configurado en **{mode}**")
+
+@bot.tree.command(name="skip", description="Salta la canción actual")
+async def skip(interaction: discord.Interaction):
     vc = interaction.guild.voice_client
     if vc and vc.is_playing():
-        vc.stop()
-        await interaction.response.send_message("⏭️ Canción saltada")
+        vc.stop()  # Dispara el after y encadena
+        await interaction.response.send_message("⏭️ Saltado")
     else:
-        await interaction.response.send_message("No se está reproduciendo nada")
-    print(f"[DEBUG][/skip] invoked by {interaction.user}")
+        await interaction.response.send_message("No hay nada sonando.")
 
-# ----- PAUSE -----
-@bot.tree.command(name="pause", description="Pause the music")
+@bot.tree.command(name="pause", description="Pausa la reproducción")
 async def pause_cmd(interaction: discord.Interaction):
     vc = interaction.guild.voice_client
     if vc and vc.is_playing():
         vc.pause()
-        await interaction.response.send_message("⏸️ Pausa activada")
+        await interaction.response.send_message("⏸️ Pausado")
     else:
-        await interaction.response.send_message("No hay reproducción activa")
-    print(f"[DEBUG][/pause] invoked by {interaction.user}")
+        await interaction.response.send_message("No hay nada sonando.")
 
-# ----- RESUME -----
-@bot.tree.command(name="resume", description="Resume the music")
+@bot.tree.command(name="resume", description="Reanuda la reproducción")
 async def resume_cmd(interaction: discord.Interaction):
     vc = interaction.guild.voice_client
     if vc and vc.is_paused():
         vc.resume()
         await interaction.response.send_message("▶️ Reanudado")
     else:
-        await interaction.response.send_message("No hay reproducción en pausa")
-    print(f"[DEBUG][/resume] invoked by {interaction.user}")
+        await interaction.response.send_message("No hay nada pausado.")
 
-# ----- STOP -----
-@bot.tree.command(name="stop", description="Stop the music and clear queue")
+@bot.tree.command(name="stop", description="Detiene la reproducción, limpia la cola y desconecta")
 async def stop_cmd(interaction: discord.Interaction):
-    guild_id = str(interaction.guild_id)
     vc = interaction.guild.voice_client
+    gid = str(interaction.guild_id)
     if vc:
-        vc.stop()
+        SONG_QUEUES.pop(gid, None)
+        CURRENT_SONG.pop(gid, None)
+        VOLUME.pop(gid, None)
+        LOOP_MODE.pop(gid, None)
+        try:
+            vc.stop()
+        except Exception:
+            pass
         await vc.disconnect()
-    SONG_QUEUES[guild_id] = deque()
-    CURRENT_SONG.pop(guild_id, None)
-    LOOP_MODE[guild_id] = "off"
-    await interaction.response.send_message("⏹️ Reproducción detenida y cola vaciada")
-    print(f"[DEBUG][/stop] invoked by {interaction.user}")
+        await interaction.response.send_message("🛑 Detenido y desconectado")
+    else:
+        await interaction.response.send_message("No estoy conectado.")
 
-# ----- QUEUE -----
-@bot.tree.command(name="queue", description="Show the song queue")
+@bot.tree.command(name="queue", description="Muestra la cola de canciones actuales")
 async def queue_cmd(interaction: discord.Interaction):
     guild_id = str(interaction.guild_id)
     queue = SONG_QUEUES.get(guild_id, deque())
     if not queue:
-        await interaction.response.send_message("La cola está vacía")
+        await interaction.response.send_message("La cola está vacía.")
         return
-    desc = ""
-    for i, song in enumerate(queue, 1):
-        desc += f"{i}. {song['title']} - {song['artist']} [{format_duration(song['duration'])}]\n"
-    embed = discord.Embed(title="🎶 Cola de reproducción", description=desc, color=0x1DB954)
-    await interaction.response.send_message(embed=embed)
-    print(f"[DEBUG][/queue] invoked by {interaction.user}")
 
-# ----- CLEARQUEUE -----
-@bot.tree.command(name="clearqueue", description="Clear the song queue")
+    message = "**Cola de canciones:**\n"
+    for i, item in enumerate(queue):
+        title = item.get("title", "Sin título")
+        artist = item.get("artist", "Desconocido")
+        message += f"{i + 1}. {title} — {artist}\n"
+
+    # Partir si excede 2000 chars
+    if len(message) > 2000:
+        chunks = [message[i:i+2000] for i in range(0, len(message), 2000)]
+        await interaction.response.send_message(chunks[0])
+        for chunk in chunks[1:]:
+            await interaction.channel.send(chunk)
+    else:
+        await interaction.response.send_message(message)
+
+@bot.tree.command(name="clearqueue", description="Limpia la cola de canciones")
 async def clearqueue_cmd(interaction: discord.Interaction):
     guild_id = str(interaction.guild_id)
-    SONG_QUEUES[guild_id] = deque()
-    await interaction.response.send_message("🗑️ Cola vaciada")
-    print(f"[DEBUG][/clearqueue] invoked by {interaction.user}")
+    if guild_id in SONG_QUEUES:
+        SONG_QUEUES[guild_id].clear()
+    await interaction.response.send_message("Cola limpiada ✅")
 
-# ----- VOLUME -----
-@bot.tree.command(name="volume", description="Set or check volume")
-@app_commands.describe(level="Volume level 0-100")
-async def volume_cmd(interaction: discord.Interaction, level: int = None):
-    guild_id = str(interaction.guild_id)
+@bot.tree.command(name="volume", description="Ajusta el volumen. Rango: 1-100")
+@app_commands.describe(level="Nivel de volumen entre 1 y 100")
+async def volume_cmd(interaction: discord.Interaction, level: int):
+    if level < 1 or level > 100:
+        await interaction.response.send_message("Por favor ingresa un valor entre 1 y 100")
+        return
+
     vc = interaction.guild.voice_client
-    if vc is None:
-        await interaction.response.send_message("No hay reproducción activa")
+    if not vc or not vc.is_connected():
+        await interaction.response.send_message("No estoy conectado a un canal de voz")
         return
-    if level is None:
-        vol = VOLUME.get(guild_id, 50)
-        await interaction.response.send_message(f"🔊 Volumen actual: {vol}%")
-    else:
-        VOLUME[guild_id] = max(0, min(level/100, 1))
-        if vc.source:
-            vc.source.volume = VOLUME[guild_id]
-        await interaction.response.send_message(f"🔊 Volumen ajustado a: {level}%")
-    print(f"[DEBUG][/volume] invoked by {interaction.user}, level={level}")
 
-# ----- NOWPLAYING -----
-@bot.tree.command(name="nowplaying", description="Show currently playing song")
-async def nowplaying_cmd(interaction: discord.Interaction):
     guild_id = str(interaction.guild_id)
-    current = CURRENT_SONG.get(guild_id)
-    if not current:
-        await interaction.response.send_message("No se está reproduciendo nada")
-        return
-    embed = discord.Embed(title="🎵 Ahora suena", description=f"[{current['title']}]({current['webpage_url']})", color=0x1DB954)
-    embed.add_field(name="Artista", value=current["artist"], inline=True)
-    embed.add_field(name="Duración", value=format_duration(current["duration"]), inline=True)
-    if current.get("thumbnail"):
-        embed.set_thumbnail(url=current["thumbnail"])
-    await interaction.response.send_message(embed=embed)
-    print(f"[DEBUG][/nowplaying] invoked by {interaction.user}")
+    vol = level / 100
+    VOLUME[guild_id] = vol
 
-# =========================
-# DUMMY SERVER PARA RENDER
-# =========================
+    # Cambiar volumen de la fuente actual
+    if vc.source and isinstance(vc.source, discord.PCMVolumeTransformer):
+        vc.source.volume = vol
+
+    await interaction.response.send_message(f"🔊 Volumen ajustado a {level}%")
+
+# ====== LETRAS CON PAGINACIÓN ======
+class LyricsView(ui.View):
+    def __init__(self, lyrics_chunks):
+        super().__init__(timeout=180)
+        self.lyrics_chunks = lyrics_chunks
+        self.current_page = 0
+
+    async def update_message(self, interaction: discord.Interaction):
+        await interaction.response.edit_message(content=f"```{self.lyrics_chunks[self.current_page]}```", view=self)
+
+    @ui.button(label="Anterior", style=discord.ButtonStyle.primary)
+    async def previous(self, interaction: discord.Interaction, button: ui.Button):
+        if self.current_page > 0:
+            self.current_page -= 1
+            await self.update_message(interaction)
+        else:
+            await interaction.response.defer()
+
+    @ui.button(label="Siguiente", style=discord.ButtonStyle.primary)
+    async def next(self, interaction: discord.Interaction, button: ui.Button):
+        if self.current_page < len(self.lyrics_chunks) - 1:
+            self.current_page += 1
+            await self.update_message(interaction)
+        else:
+            await interaction.response.defer()
+
+    async def on_timeout(self):
+        for child in self.children:
+            child.disabled = True
+        # Puedes editar el mensaje para deshabilitar los botones si lo deseas
+
+@bot.tree.command(name="letra", description="Busca la letra de una canción.")
+@app_commands.describe(artista="Nombre del artista", cancion="Título de la canción")
+async def letra(interaction: discord.Interaction, artista: str, cancion: str):
+    await interaction.response.defer()
+
+    artist_url = artista.replace(" ", "%20")
+    title_url = cancion.replace(" ", "%20")
+
+    url = f"https://api.lyrics.ovh/v1/{artist_url}/{title_url}"
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    lyrics = data.get("lyrics", "Letra no encontrada.")
+                else:
+                    lyrics = "No encontré la letra. Asegúrate de que el nombre sea correcto."
+    except Exception:
+        lyrics = "Hubo un error al consultar la API de letras."
+
+    # Dividir letra en trozos de máximo ~1800 caracteres
+    max_chunk_len = 1800
+    lyrics_chunks = []
+    text = lyrics
+    while len(text) > max_chunk_len:
+        cut_index = text.rfind('\n', 0, max_chunk_len)
+        if cut_index == -1:
+            cut_index = max_chunk_len
+        lyrics_chunks.append(text[:cut_index])
+        text = text[cut_index:]
+    lyrics_chunks.append(text)
+
+    header = f"**Letra de {cancion.title()} - {artista.title()}**:\n"
+
+    # Enviar con paginación si hay varias páginas
+    if len(lyrics_chunks) > 1:
+        view = LyricsView(lyrics_chunks)
+        await interaction.followup.send(content=header + f"```{lyrics_chunks[0]}```", view=view)
+    else:
+        await interaction.followup.send(content=header + f"```{lyrics_chunks[0]}```")
+
+# ====== LAST.FM INTEGRACIÓN ======
+@bot.tree.command(name="lastfm", description="Muestra tu última canción escuchada en Last.fm")
+async def lastfm_cmd(interaction: discord.Interaction):
+    if not LASTFM_API_KEY or not LASTFM_USER:
+        await interaction.response.send_message("Configura LASTFM_API_KEY y LASTFM_USER en tu .env para usar este comando.")
+        return
+
+    try:
+        url = (
+            "http://ws.audioscrobbler.com/2.0/"
+            f"?method=user.getrecenttracks&user={LASTFM_USER}"
+            f"&api_key={LASTFM_API_KEY}&format=json&limit=1"
+        )
+        resp = requests.get(url, timeout=10).json()
+        track = resp["recenttracks"]["track"][0]
+        title = track.get("name", "Desconocido")
+        artist = track.get("artist", {}).get("#text", "Desconocido")
+        img_list = track.get("image", [])
+        img = img_list[-1]["#text"] if img_list else ""
+
+        embed = discord.Embed(
+            title="🎧 Última canción en Last.fm",
+            description=f"**{title}** — {artist}",
+            color=0xff0000
+        )
+        if img:
+            embed.set_thumbnail(url=img)
+        await interaction.response.send_message(embed=embed)
+    except Exception as e:
+        await interaction.response.send_message(f"No se pudo consultar Last.fm: {e}")
+
+# ====== HELP ======
+@bot.tree.command(name="help", description="Muestra todos los comandos disponibles")
+async def help_cmd(interaction: discord.Interaction):
+    embed = discord.Embed(title="📜 Comandos de Música", color=discord.Color.blue())
+    embed.add_field(name="/play <canción/url>", value="Reproduce una canción o añade a la cola (YouTube/Spotify).", inline=False)
+    embed.add_field(name="/skip", value="Salta la canción actual.", inline=False)
+    embed.add_field(name="/pause", value="Pausa la canción que se está reproduciendo.", inline=False)
+    embed.add_field(name="/resume", value="Reanuda la canción pausada.", inline=False)
+    embed.add_field(name="/stop", value="Detiene la reproducción, limpia la cola y desconecta.", inline=False)
+    embed.add_field(name="/loop <off/one/all>", value="Configura el modo repetición: sin loop, repetir una, o repetir toda la cola.", inline=False)
+    embed.add_field(name="/queue", value="Muestra la cola de canciones (se divide si es muy larga).", inline=False)
+    embed.add_field(name="/clearqueue", value="Limpia la cola de canciones.", inline=False)
+    embed.add_field(name="/volume <1-100>", value="Ajusta el volumen de la música.", inline=False)
+    embed.add_field(name="/nowplaying", value="Muestra info detallada de la canción actual (título, artista, duración y miniatura).", inline=False)
+    embed.add_field(name="/seek <segundos>", value="Avanza o retrocede a un tiempo específico de la canción actual.", inline=False)
+    embed.add_field(name="/letra <artista> <canción>", value="Busca la letra con paginación.", inline=False)
+    embed.add_field(name="/lastfm", value="Muestra tu última canción escuchada en Last.fm.", inline=False)
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+
+from threading import Thread
+from http.server import HTTPServer, BaseHTTPRequestHandler
+
 PORT = int(os.environ.get("PORT", 10000))
+
 class DummyHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -383,15 +629,11 @@ class DummyHandler(BaseHTTPRequestHandler):
 
 def start_dummy_server():
     server = HTTPServer(("0.0.0.0", PORT), DummyHandler)
-    print(f"[DEBUG] Dummy server corriendo en puerto {PORT}")
     server.serve_forever()
 
 Thread(target=start_dummy_server, daemon=True).start()
+print(f"Bot corriendo en Render (dummy port {PORT})")
 
-# =========================
-# RUN BOT
-# =========================
-try:
-    bot.run(TOKEN)
-except Exception as e:
-    print(f"[ERROR][bot.run] {e}")
+# Luego tu bot
+bot.run(TOKEN)
+
